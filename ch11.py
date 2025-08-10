@@ -649,6 +649,7 @@ if __name__ == "__main__":
 
                     ATR_THRESHOLD = 0.015
 
+                    # === 매수 조건 ===
                     if isinstance(ml_signal, (int, float)) and 0 <= ml_signal <= 1:
                         if ml_signal > ML_THRESHOLD and macd > signal and rsi < 50 and adx > 20 and atr > ATR_THRESHOLD:
                             krw_balance = get_balance("KRW")
@@ -668,40 +669,82 @@ if __name__ == "__main__":
                         else:
                             print(f"[{ticker}] 매수 조건 불충족")
 
+                    # === 매도 조건 ===
                     if ticker in entry_prices:
                         entry_price = entry_prices[ticker]
                         highest_prices[ticker] = max(highest_prices.get(ticker, entry_price), current_price)
-                        
-                        if should_sell(ticker, current_price, ml_signal):
-                            change_ratio = (current_price - entry_price) / entry_price  # 총 수익률
+
+                        if entry_price == 0:
+                            print(f"[{ticker}] 경고: entry_price가 0입니다. 매도 판단 건너뜀")
+                            continue
+
+                        change_ratio = (current_price - entry_price) / entry_price
+                        peak_drop = (highest_prices[ticker] - current_price) / max(highest_prices[ticker], 1e-9)
+
+                        will_sell = False
+                        try:
+                            will_sell = should_sell(ticker, current_price, ml_signal)
+                        except Exception as e:
+                            print(f"[{ticker}] should_sell 평가 오류: {e}")
+
+                        force_liquidate = (change_ratio <= -0.05) or (change_ratio >= 0.20)
+
+                        if will_sell or force_liquidate:
                             try:
                                 coin = ticker.split('-')[1]
                                 coin_balance = get_balance(coin)
                             except Exception as e:
                                 print(f"[{ticker}] 잔고 확인 에러: {e}")
-                                continue
-                                
-                            if coin_balance > 0:
-                                # 손절 조건: -5% 손실일 경우 무조건 매도
-                                if change_ratio < -0.05:
-                                    print(f"[{ticker}] 🚨 -5% 손절 조건 → 강제 매도")
-                                    sell_crypto_currency(ticker, coin_balance)
-                                    
-                                # 나머지 조건에서는 AI 신호가 낮으면 매도, 높으면 보류
-                                elif ml_signal < ML_SELL_THRESHOLD:
-                                    print(f"[{ticker}] ✅ 기타 매도 조건 + AI 약함 → 매도")
-                                    sell_crypto_currency(ticker, coin_balance)
-                                else:
-                                    print(f"[{ticker}] ⚠️ AI 신호 강함 → 매도 보류")
-                                    continue  # 매도 보류 시 후처리 생략
+                                coin_balance = 0
 
-                                # 매도 후 공통 정리
-                                del entry_prices[ticker]
-                                del highest_prices[ticker]
-                                recent_trades[ticker] = now
+                            if coin_balance and coin_balance > 0:
+                                reason = []
+                                if change_ratio <= -0.05:
+                                    reason.append("강제 손절(-5% 이하)")
+                                if change_ratio >= 0.20:
+                                    reason.append("강제 익절(+20% 이상)")
+                                if will_sell and not reason:
+                                    reason.append("전략 매도(should_sell=True)")
+
+                                print(f"[{ticker}] 매도 실행: {', '.join(reason)} | 수익률: {change_ratio*100:.2f}% | 고점대비하락: {peak_drop*100:.2f}%")
+
+                                sold = False
+                                for attempt in range(2):
+                                    try:
+                                        order = sell_crypto_currency(ticker, coin_balance)
+                                        if order:
+                                            sold = True
+                                            break
+                                        else:
+                                            print(f"[{ticker}] 매도 주문 실패(시도 {attempt+1}) → 재시도")
+                                            time.sleep(1.0)
+                                    except Exception as e:
+                                        print(f"[{ticker}] 매도 주문 에러(시도 {attempt+1}): {e}")
+                                        time.sleep(1.0)
+
+                                if sold:
+                                    time.sleep(0.7)
+                                    try:
+                                        remain = get_balance(coin)
+                                    except Exception as e:
+                                        print(f"[{ticker}] 매도 후 잔고 확인 실패: {e}")
+                                        remain = None
+
+                                    if remain is None or remain < 1e-8:
+                                        entry_prices.pop(ticker, None)
+                                        highest_prices.pop(ticker, None)
+                                        recent_trades[ticker] = now
+                                        print(f"[{ticker}] ✅ 매도 완료 및 상태 정리")
+                                    else:
+                                        print(f"[{ticker}] ⚠️ 매도 후 잔여 수량 감지({remain}). 다음 루프에서 재처리 예정.")
+                                else:
+                                    print(f"[{ticker}] ❌ 매도 실패: 주문 체결 안됨")
+                            else:
+                                print(f"[{ticker}] 매도 불가: 보유 수량 없음 또는 조회 실패")
 
                 except Exception as e:
                     print(f"[{ticker}] 처리 중 에러 발생: {e}")
 
     except KeyboardInterrupt:
         print("프로그램이 종료되었습니다.")
+
