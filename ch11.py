@@ -51,8 +51,10 @@ ACCESS_KEY = "J8iGqPwfjkX7Yg9bdzwFGkAZcTPU7rElXRozK7O4"
 SECRET_KEY = "6MGxH2WjIftgQ85SLK1bcLxV4emYvrpbk6nYuqRN"
 
 # 모델 학습 주기 관련 변수
-last_trained_time = None  # 마지막 학습 시간
-TRAINING_INTERVAL = timedelta(hours=8)  # 6시간마다 재학습
+# 모델 재학습 타임스탬프(티커별)
+last_trained_time = {}  # { "KRW-BTC": datetime, ... }
+ # 마지막 학습 시간
+TRAINING_INTERVAL = timedelta(hours=6)  # 6시간마다 재학습
 
 # 매매 전략 관련 임계값
 ML_THRESHOLD = 0.5
@@ -71,7 +73,8 @@ MIN_ORDER_KRW = 6000         # 업비트 최소 주문 여유치
 entry_prices = {}            # 매수한 가격 저장
 highest_prices = {}          # 매수 후 최고 가격 저장
 recent_trades = {}           # ✅ 최근 거래 기록 ← 이게 꼭 있어야 해!
-recent_surge_tickers = {}    # 최근 급상승 감지 코인 저장
+recent_surge_tickers = {}
+last_top_update = datetime.min # 최근 급상승 감지 코인 저장
 
 log = logging.getLogger("bot")
 log.setLevel(logging.INFO)
@@ -135,20 +138,23 @@ entry_prices = load_pickle("entry_prices.pkl", {})
 recent_trades = load_pickle("recent_trades.pkl", {})
 highest_prices = load_pickle("highest_prices.pkl", {})
 
+state_lock = threading.Lock()
+
 def atomic_save(obj, path):
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         pickle.dump(obj, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)  # atomic
+    os.replace(tmp, path)
 
 def auto_save_state(interval=300):
     while True:
         try:
-            atomic_save(entry_prices, "entry_prices.pkl")
-            atomic_save(recent_trades, "recent_trades.pkl")
-            atomic_save(highest_prices, "highest_prices.pkl")
+            with state_lock:
+                atomic_save(entry_prices, "entry_prices.pkl")
+                atomic_save(recent_trades, "recent_trades.pkl")
+                atomic_save(highest_prices, "highest_prices.pkl")
             log.info("[백업] 상태 자동 저장 완료")
         except Exception as e:
             log.exception(f"[백업 오류] 상태 저장 실패: {e}")
@@ -376,14 +382,12 @@ def train_transformer_model(ticker, epochs=50):
     print(f"모델 학습 완료: {ticker}")
     return model
 
-def should_retrain(ticker, last_trained_time_dict, model, min_performance=1.05):
+def should_retrain(ticker, model, min_performance=1.05):
     now = datetime.now()
-    last_time = last_trained_time_dict.get(ticker, datetime.min)
-
+    last_time = last_trained_time.get(ticker, datetime.min)
     if now - last_time > TRAINING_INTERVAL:
         perf = backtest(ticker, model)
         if perf < min_performance:
-            print(f"[{ticker}] 모델 재학습 필요 (성과: {perf:.2f})")
             return True
     return False
     
@@ -564,6 +568,7 @@ if __name__ == "__main__":
         performance = backtest(ticker, model)
         if performance > 1.05:
             models[ticker] = model
+            last_trained_time[ticker] = datetime.now()
             print(f"[{ticker}] 모델 유지 (백테스트 성과: {performance:.2f}배)")
         else:
             print(f"[{ticker}] 모델 제외 (백테스트 성과 부족: {performance:.2f}배)")
@@ -574,20 +579,22 @@ if __name__ == "__main__":
         while True:
             now = datetime.now()
 
-            # ✅ 1. 상위 코인 업데이트
-            if now.hour % 6 == 0 and now.minute == 0:
+            # ✅ 1. 상위 코인 업데이트 (윈도우 조건)
+            if (now - last_top_update) >= timedelta(hours=6):
                 top_tickers = get_top_tickers(n=40)
                 print(f"[{now}] 상위 코인 업데이트: {top_tickers}")
+                last_top_update = now  # ✅ 갱신 시각 저장
 
                 for ticker in top_tickers:
                     model = models.get(ticker)
-                    if model is None or should_retrain(ticker, recent_trades, model):
+                    if model is None or should_retrain(ticker, model):
                         model = train_transformer_model(ticker)
                         if model is None:
                             continue
                         performance = backtest(ticker, model)
                         if performance >= 1.05:
                             models[ticker] = model
+                            last_trained_time[ticker] = datetime.now()
                             print(f"[{ticker}] 모델 추가/갱신 (성과: {performance:.2f}배)")
                         else:
                             print(f"[{ticker}] 모델 제외 (성과 부족: {performance:.2f}배)")
@@ -606,6 +613,7 @@ if __name__ == "__main__":
                         performance = backtest(ticker, model)
                         if performance > 1.1:
                             models[ticker] = model
+                            last_trained_time[ticker] = datetime.now()
                             print(f"[{ticker}] 급상승 모델 추가 (백테스트 성과: {performance:.2f}배)")
                         else:
                             print(f"[{ticker}] 급상승 모델 제외 (백테스트 성과 부족: {performance:.2f}배)")
@@ -688,9 +696,10 @@ if __name__ == "__main__":
 
                                     buy_result = buy_crypto_currency(ticker, buy_amount)
                                     if buy_result:
-                                        entry_prices[ticker] = current_price
-                                        highest_prices[ticker] = current_price
-                                        recent_trades[ticker] = now
+                                        with state_lock:
+                                            entry_prices[ticker] = current_price
+                                            highest_prices[ticker] = current_price
+                                            recent_trades[ticker] = now
 
                                         # 같은 루프에서 즉시 차감
                                         remaining_krw -= buy_amount
@@ -755,6 +764,8 @@ if __name__ == "__main__":
                                             time.sleep(1.0)
                                     except Exception as e:
                                         print(f"[{ticker}] 매도 주문 에러(시도 {attempt+1}): {e}")
+                                        with state_lock:
+                                            recent_trades[ticker] = now
                                         time.sleep(1.0)
 
                                 if sold:
@@ -766,13 +777,16 @@ if __name__ == "__main__":
                                         remain = None
 
                                     if remain is None or remain < 1e-8:
-                                        entry_prices.pop(ticker, None)
-                                        highest_prices.pop(ticker, None)
-                                        recent_trades[ticker] = now
-                                        print(f"[{ticker}] ✅ 매도 완료 및 상태 정리")
+                                        with state_lock:
+                                            entry_prices.pop(ticker, None)
+                                            highest_prices.pop(ticker, None)
+                                            recent_trades[ticker] = now
+                                            print(f"[{ticker}] ✅ 매도 완료 및 상태 정리")
                                     else:
                                         print(f"[{ticker}] ⚠️ 매도 후 잔여 수량 감지({remain}). 다음 루프에서 재처리 예정.")
                                 else:
+                                    with state_lock:
+                                        recent_trades[ticker] = now
                                     print(f"[{ticker}] ❌ 매도 실패: 주문 체결 안됨")
                             else:
                                 print(f"[{ticker}] 매도 불가: 보유 수량 없음 또는 조회 실패")
