@@ -62,6 +62,11 @@ TAKE_PROFIT_THRESHOLD = 0.1  # 익절 (10%)
 COOLDOWN_TIME = timedelta(minutes=30)  # 동일 코인 재거래 쿨다운 시간
 SURGE_COOLDOWN_TIME = timedelta(minutes=60) # 급등 코인 쿨다운 시간
 
+# === 포지션/현금 배분 설정 ===
+MAX_ACTIVE_POSITIONS = 3     # 동시에 보유할 코인 최대 개수
+USE_CASH_RATIO = 0.95        # 매수에 사용할 현금 비율(예: 95%)
+MIN_ORDER_KRW = 6000         # 업비트 최소 주문 여유치
+
 # 계좌 정보 저장
 entry_prices = {}            # 매수한 가격 저장
 highest_prices = {}          # 매수 후 최고 가격 저장
@@ -605,8 +610,30 @@ if __name__ == "__main__":
                         else:
                             print(f"[{ticker}] 급상승 모델 제외 (백테스트 성과 부족: {performance:.2f}배)")
 
-            # ✅ 3. 매수/매도 대상 선정
-            target_tickers = set(top_tickers) | set(recent_surge_tickers.keys())
+            # ✅ 3. 매수/매도 대상 선정 (동시 포지션 최대치 & 현금 균등 배분)
+            # 보유 중인 코인 포함해서 감시 대상 구성
+            held_tickers = set(entry_prices.keys())
+            target_tickers = set(top_tickers) | set(recent_surge_tickers.keys()) | held_tickers
+
+            # 남은 신규 매수 슬롯 계산 (최대 MAX_ACTIVE_POSITIONS)
+            slots_available = max(0, MAX_ACTIVE_POSITIONS - len(held_tickers))
+
+            # 우선순위: ① 급상승 감지(미보유) → ② 상위 코인(미보유)
+            priority_buy_list = []
+            for t in list(recent_surge_tickers.keys()):
+                if t not in held_tickers:
+                    priority_buy_list.append(t)
+            for t in top_tickers:
+                if t not in held_tickers and t not in priority_buy_list:
+                    priority_buy_list.append(t)
+
+            # 실제 신규 매수 허용 후보(남은 슬롯 수만큼)
+            buy_allowed_tickers = set(priority_buy_list[:slots_available])
+            print(f"[BUY-SELECTION] held={list(held_tickers)} slots={slots_available} allowed={list(buy_allowed_tickers)}")
+
+            # 이번 루프에서 사용할 KRW/슬롯 스냅샷 (과집행 방지)
+            remaining_krw = get_balance("KRW")
+            remaining_slots = slots_available
 
             for ticker in target_tickers:
                 cooldown_limit = SURGE_COOLDOWN_TIME if ticker in recent_surge_tickers else COOLDOWN_TIME
@@ -639,7 +666,7 @@ if __name__ == "__main__":
 
                     ml_signal = get_ml_signal(ticker, models[ticker])
 
-                    print(f"[DEBUG] {ticker} 매수 조건 검사")
+                    print(f"[DEBUG] {ticker} 매수/매도 조건 검사")
                     print(f" - ML 신호: {ml_signal:.4f}")
                     print(f" - MACD: {macd:.4f}, Signal: {signal:.4f}")
                     print(f" - RSI: {rsi:.2f}")
@@ -650,24 +677,32 @@ if __name__ == "__main__":
                     ATR_THRESHOLD = 0.015
 
                     # === 매수 조건 ===
-                    if isinstance(ml_signal, (int, float)) and 0 <= ml_signal <= 1:
-                        if ml_signal > ML_THRESHOLD and macd > signal and rsi < 50 and adx > 20 and atr > ATR_THRESHOLD:
-                            krw_balance = get_balance("KRW")
-                            print(f"[DEBUG] 보유 원화 잔고: {krw_balance:.2f}")
-                            if krw_balance > 5000:
-                                buy_amount = krw_balance * 0.3
-                                buy_result = buy_crypto_currency(ticker, buy_amount)
-                                if buy_result:
-                                    entry_prices[ticker] = current_price
-                                    highest_prices[ticker] = current_price
-                                    recent_trades[ticker] = now
-                                    print(f"[{ticker}] 매수 완료: {buy_amount:.2f}원, 가격: {current_price:.2f}")
+                    if ticker in buy_allowed_tickers and remaining_slots > 0:
+                        if isinstance(ml_signal, (int, float)) and 0 <= ml_signal <= 1:
+                            if ml_signal > ML_THRESHOLD and macd > signal and rsi < 50 and adx > 20 and atr > ATR_THRESHOLD:
+                                if remaining_krw > MIN_ORDER_KRW:
+                                    # 남은 슬롯에 균등 배분 (이번 루프 내에서 과집행 방지)
+                                    per_slot_budget = (remaining_krw * USE_CASH_RATIO) / max(1, remaining_slots)
+                                    buy_amount = max(MIN_ORDER_KRW, per_slot_budget)
+                                    buy_amount = min(buy_amount, remaining_krw * USE_CASH_RATIO)  # 안전 상한
+
+                                    buy_result = buy_crypto_currency(ticker, buy_amount)
+                                    if buy_result:
+                                        entry_prices[ticker] = current_price
+                                        highest_prices[ticker] = current_price
+                                        recent_trades[ticker] = now
+
+                                        # 같은 루프에서 즉시 차감
+                                        remaining_krw -= buy_amount
+                                        remaining_slots -= 1
+
+                                        print(f"[{ticker}] 매수 완료: {buy_amount:.0f}원, 가격: {current_price:.2f} | 남은KRW≈{remaining_krw:.0f}, 남은슬롯={remaining_slots}")
+                                    else:
+                                        print(f"[{ticker}] 매수 요청 실패")
                                 else:
-                                    print(f"[{ticker}] 매수 요청 실패")
+                                    print(f"[{ticker}] 매수 불가 (KRW<{MIN_ORDER_KRW})")
                             else:
-                                print(f"[{ticker}] 매수 불가 (원화 부족)")
-                        else:
-                            print(f"[{ticker}] 매수 조건 불충족")
+                                print(f"[{ticker}] 매수 조건 불충족")
 
                     # === 매도 조건 ===
                     if ticker in entry_prices:
@@ -747,4 +782,5 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print("프로그램이 종료되었습니다.")
+
 
