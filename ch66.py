@@ -683,6 +683,29 @@ def get_top_tickers(n=None):
     sorted_scores = sorted(scores, key=lambda x: x[1], reverse=True)
     return [ticker for ticker, _ in sorted_scores[:n]]
 
+def detect_surge_tickers(threshold=0.03, interval="minute5", lookback=3):
+    """
+    최근 5분봉 기준, lookback개 봉 동안 상승률이 threshold 이상인 코인을 감지
+    예: threshold=0.03이면 약 +3% 이상 급등한 코인만 반환
+    """
+    tickers = pyupbit.get_tickers(fiat="KRW")
+    surged = []
+    for ticker in tickers:
+        try:
+            df = pyupbit.get_ohlcv(ticker, interval=interval, count=lookback+1)
+            if df is None or len(df) < lookback + 1:
+                continue
+            old_price = df['close'].iloc[0]
+            new_price = df['close'].iloc[-1]
+            change = (new_price - old_price) / old_price
+            if change >= threshold:
+                surged.append(ticker)
+        except Exception:
+            continue
+    if surged:
+        log.info(f"[SURGE] 감지된 급등 코인: {surged}")
+    return surged
+
 # ====== 자동 저장 쓰레드 시작 ======
 save_thread = threading.Thread(target=auto_save_state, daemon=True)
 save_thread.start()
