@@ -14,6 +14,7 @@ import logging
 import math
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict, deque
+import sys
 
 # ====== (선택) 실거래 전 모의체결을 원한다면 True ======
 DRY_RUN = False  # True면 주문은 로그만, 계좌 변동 없음
@@ -84,6 +85,10 @@ handler = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=3, enco
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 handler.setFormatter(formatter)
 log.addHandler(handler)
+
+console = logging.StreamHandler()
+console.setFormatter(formatter)
+log.addHandler(console)
 
 def safe_sleep(sec):
     try:
